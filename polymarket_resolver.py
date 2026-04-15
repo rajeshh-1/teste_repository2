@@ -23,7 +23,7 @@ log = logging.getLogger("polymarket_resolver")
 
 # Shared state
 _lock = threading.Lock()
-_results = {}  # slug -> {"result": "Up"/"Down", "ts": float}
+_results = {}  # slug -> {"result": "Up"/"Down", "ts": float, "source": str}
 _token_map = {}  # token_id -> {"outcome": "Up"/"Down", "slug": str}
 _zero_price_first_seen = {}  # token_id -> timestamp
 
@@ -33,6 +33,7 @@ _loop = None
 
 ZERO_PRICE_THRESHOLD = 0.005
 ZERO_PRICE_CONFIRM_SECONDS = 2.0
+OFFICIAL_SOURCES = {"market_resolved"}
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_URL = "https://gamma-api.polymarket.com/events"
@@ -66,6 +67,33 @@ def _opposite_outcome(outcome: str) -> Optional[str]:
     if side == "down":
         return "Up"
     return None
+
+
+def _normalize_outcome(value: str) -> Optional[str]:
+    side = str(value or "").strip().lower()
+    if side in ("up", "yes"):
+        return "Up"
+    if side in ("down", "no"):
+        return "Down"
+    return None
+
+
+def _store_result(slug: str, result: str, source: str, detail: str = "") -> None:
+    slug_text = str(slug or "").strip()
+    res_text = _normalize_outcome(result)
+    if not slug_text or res_text is None:
+        return
+
+    now = time.time()
+    with _lock:
+        if slug_text in _results:
+            return
+        _results[slug_text] = {"result": res_text, "ts": now, "source": str(source or "unknown")}
+
+    if detail:
+        log.info(f"[resolver] RESOLUTION ({source}): {slug_text} -> {res_text} | {detail}")
+    else:
+        log.info(f"[resolver] RESOLUTION ({source}): {slug_text} -> {res_text}")
 
 
 def _fetch_tokens_for_slug(slug: str) -> dict:
@@ -143,10 +171,16 @@ def ensure_slug_registered(slug: str) -> bool:
 
 
 def peek_result_for_slug(slug: str) -> Optional[str]:
-    """Non-blocking read of cached result for a slug."""
+    """
+    Non-blocking read of cached OFFICIAL result for a slug.
+    (Heuristic results are ignored here.)
+    """
     with _lock:
         entry = _results.get(str(slug or "").strip())
     if not entry:
+        return None
+    source = str(entry.get("source") or "").strip()
+    if source not in OFFICIAL_SOURCES:
         return None
     return str(entry.get("result") or "").strip() or None
 
@@ -202,10 +236,54 @@ def _clear_zero_trackers_for_slug(slug: str) -> None:
 def _process_event(event: dict):
     """
     Resolution logic:
+    - official: market_resolved event (preferred).
     - asset at ~0.00 for 2s => this outcome likely LOST, opposite wins.
     - backup: asset at >=0.98 => this outcome wins.
     """
-    if event.get("event_type") != "last_trade_price":
+    event_type = str(event.get("event_type") or "").strip().lower()
+
+    # Preferred official path from Polymarket market channel.
+    if event_type == "market_resolved":
+        try:
+            slug = str(event.get("slug") or "").strip()
+            winning_outcome = _normalize_outcome(str(event.get("winning_outcome") or ""))
+            winning_asset_id = str(event.get("winning_asset_id") or "").strip()
+
+            # Fallback: infer via token map when winning_outcome is absent/unknown.
+            if winning_outcome is None and winning_asset_id:
+                with _lock:
+                    token_info = _token_map.get(winning_asset_id)
+                if token_info:
+                    winning_outcome = _normalize_outcome(token_info.get("outcome"))
+                    if not slug:
+                        slug = str(token_info.get("slug") or "").strip()
+
+            # Last fallback: infer slug from listed assets_ids.
+            if not slug:
+                for asset_id in event.get("assets_ids") or []:
+                    aid = str(asset_id or "").strip()
+                    if not aid:
+                        continue
+                    with _lock:
+                        token_info = _token_map.get(aid)
+                    if token_info and token_info.get("slug"):
+                        slug = str(token_info.get("slug")).strip()
+                        break
+
+            if winning_outcome and slug:
+                _store_result(
+                    slug=slug,
+                    result=winning_outcome,
+                    source="market_resolved",
+                    detail=f"winning_outcome={winning_outcome}",
+                )
+                _clear_zero_trackers_for_slug(slug)
+            return
+        except Exception as e:
+            log.debug(f"[resolver] market_resolved parse error: {e}")
+            return
+
+    if event_type != "last_trade_price":
         return
 
     try:
@@ -242,10 +320,11 @@ def _process_event(event: dict):
                     result = _opposite_outcome(outcome)
                     if result is None:
                         return
-                    _results[slug] = {"result": result, "ts": now}
-                    log.info(
-                        f"[resolver] RESOLUTION (early zero): {slug} -> {result} "
-                        f"(token {outcome} near $0.00 for {now - first_seen:.1f}s)"
+                    _store_result(
+                        slug=slug,
+                        result=result,
+                        source="price_heuristic_zero",
+                        detail=f"token {outcome} near $0.00 for {now - first_seen:.1f}s",
                     )
             _clear_zero_trackers_for_slug(slug)
             return
@@ -256,12 +335,12 @@ def _process_event(event: dict):
 
         # Backup resolution path
         if price >= 0.98:
-            with _lock:
-                if slug not in _results:
-                    _results[slug] = {"result": outcome, "ts": now}
-                    log.info(
-                        f"[resolver] RESOLUTION (backup >=0.98): {slug} -> {outcome} (price={price:.3f})"
-                    )
+            _store_result(
+                slug=slug,
+                result=outcome,
+                source="price_heuristic_ge98",
+                detail=f"price={price:.3f}",
+            )
             _clear_zero_trackers_for_slug(slug)
     except Exception as e:
         log.debug(f"[resolver] event processing error: {e}")
@@ -361,10 +440,13 @@ def is_resolver_running() -> bool:
     return bool(_ws_running and _ws_thread is not None and _ws_thread.is_alive())
 
 
-def get_result_from_ws(block_end_timestamp: int, timeout: float = 15.0) -> Optional[str]:
+def get_result_from_ws(
+    block_end_timestamp: int, timeout: float = 15.0, include_heuristics: bool = False
+) -> Optional[str]:
     """
     Wait for result for a block_end timestamp.
     Returns "Up", "Down" or None on timeout.
+    By default, returns only OFFICIAL websocket outcomes (market_resolved).
     """
     slug = _slug_for_ts(block_end_timestamp)
     deadline = time.time() + timeout
@@ -381,7 +463,9 @@ def get_result_from_ws(block_end_timestamp: int, timeout: float = 15.0) -> Optio
         with _lock:
             entry = _results.get(slug)
         if entry:
-            return entry["result"]
+            source = str(entry.get("source") or "").strip()
+            if include_heuristics or source in OFFICIAL_SOURCES:
+                return entry["result"]
         time.sleep(0.1)
 
     log.warning(f"[resolver] timeout waiting for {slug}")

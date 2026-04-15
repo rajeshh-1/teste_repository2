@@ -12,6 +12,43 @@ ASSET_5M_CONFIG = {
     "eth": {"folder_name": "eth 5min", "file_prefix": "eth_updown"},
     "sol": {"folder_name": "sol 5min", "file_prefix": "sol_updown"},
 }
+PAPER_TRADE_COLUMNS = [
+    "captured_at_utc",
+    "slug",
+    "question",
+    "start_time_utc",
+    "end_time_utc",
+    "side",
+    "shares",
+    "entry_price",
+    "entry_time_utc",
+    "entry_cost",
+    "resolved_result",
+    "won",
+    "payout",
+    "trade_pnl",
+    "cash_after",
+    "pnl_after",
+    "sequence_index_before",
+    "sequence_index_after",
+    "sequence_pattern",
+]
+CAPTURE_COLUMNS = [
+    "captured_at_utc",
+    "slug",
+    "question",
+    "start_time_utc",
+    "end_time_utc",
+    "target_price",
+    "target_ts_utc",
+    "target_src",
+    "close_price",
+    "close_ts_utc",
+    "close_src",
+    "delta",
+    "inferred_result",
+    "decision_delay_seconds",
+]
 
 
 def _default_paths_for_asset(asset: str) -> tuple[Path, Path]:
@@ -22,14 +59,23 @@ def _default_paths_for_asset(asset: str) -> tuple[Path, Path]:
     return (base / f"{prefix}_paper_trade.csv", base / f"{prefix}_fast_capture.csv")
 
 
-def _read_csv(path: Path) -> pd.DataFrame:
+def _read_csv(path: Path, expected_columns: Optional[list[str]] = None) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     try:
-        return pd.read_csv(path)
+        df = pd.read_csv(path)
     except Exception as exc:
         st.error(f"Falha ao ler {path}: {exc}")
         return pd.DataFrame()
+    if expected_columns:
+        missing_expected = [col for col in expected_columns if col not in df.columns]
+        if missing_expected and len(df.columns) == len(expected_columns):
+            try:
+                return pd.read_csv(path, header=None, names=expected_columns)
+            except Exception as exc:
+                st.error(f"Falha ao ler {path} sem cabecalho: {exc}")
+                return pd.DataFrame()
+    return df
 
 
 def _to_datetime(series: pd.Series) -> pd.Series:
@@ -113,7 +159,11 @@ def _prepare_paper_df(df: pd.DataFrame) -> pd.DataFrame:
     out["sequence_step_label"] = out.apply(_sequence_label, axis=1)
     out["next_side"] = out.apply(_next_side, axis=1)
 
-    return out.sort_values("captured_at_utc")
+    if "captured_at_utc" in out.columns:
+        out = out.sort_values("captured_at_utc")
+    if "slug" in out.columns:
+        out = out.drop_duplicates(subset=["slug"], keep="last")
+    return out
 
 
 def _prepare_capture_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -135,7 +185,11 @@ def _prepare_capture_df(df: pd.DataFrame) -> pd.DataFrame:
     if "inferred_result" in out.columns:
         out["inferred_result"] = out["inferred_result"].astype(str).str.upper()
 
-    return out.sort_values("captured_at_utc")
+    if "captured_at_utc" in out.columns:
+        out = out.sort_values("captured_at_utc")
+    if "slug" in out.columns:
+        out = out.drop_duplicates(subset=["slug"], keep="last")
+    return out
 
 
 def _calc_max_drawdown(trades: pd.DataFrame) -> float:
@@ -558,9 +612,9 @@ def main() -> None:
 
     render_header_status(paper_csv_path, capture_csv_path)
 
-    paper = _prepare_paper_df(_read_csv(paper_csv_path))
+    paper = _prepare_paper_df(_read_csv(paper_csv_path, expected_columns=PAPER_TRADE_COLUMNS))
     paper, gale_base_shares = _prepare_gale_columns(paper, gale_base_shares_input)
-    capture = _prepare_capture_df(_read_csv(capture_csv_path))
+    capture = _prepare_capture_df(_read_csv(capture_csv_path, expected_columns=CAPTURE_COLUMNS))
 
     st.divider()
     render_kpis(paper)

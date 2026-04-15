@@ -689,6 +689,7 @@ class FastResolver:
         paper_entry_max_price: float,
         paper_gale_multiplier: float,
         paper_gale_max_steps: int,
+        paper_max_open_positions: int,
         paper_output_csv: str,
         paper_output_xlsx: Optional[str],
         enable_paper_xlsx: bool,
@@ -732,8 +733,9 @@ class FastResolver:
         self.paper_entry_max_price = max_price
         self.paper_gale_multiplier = max(1.0, float(paper_gale_multiplier))
         self.paper_gale_max_steps = max(0, int(paper_gale_max_steps))
+        self.paper_max_open_positions = max(0, int(paper_max_open_positions))
         self.paper_loss_streak = 0
-        self.paper_open_position: Optional[PaperPosition] = None
+        self.paper_open_positions: Dict[str, PaperPosition] = {}
         self.paper_entered_slugs = set()
         self.paper_skipped_slugs = set()
         self.paper_ignored_slugs = set()
@@ -957,8 +959,13 @@ class FastResolver:
             return float(self.paper_stake_usd * gale)
         return float(self.paper_shares * gale * entry_price)
 
+    def _can_open_more_positions(self) -> bool:
+        if self.paper_max_open_positions <= 0:
+            return True
+        return len(self.paper_open_positions) < self.paper_max_open_positions
+
     def _maybe_open_paper_trade(self, now_ts: float) -> None:
-        if self.paper_open_position is not None:
+        if not self._can_open_more_positions():
             return
 
         eligible: List[CycleState] = []
@@ -981,11 +988,11 @@ class FastResolver:
         if not eligible:
             return
 
-        side = self.paper_sequence[self.paper_sequence_idx]
-
-        # Tenta do ciclo mais recente para o mais antigo ainda elegivel.
-        # Assim continuamos tentando ate o fim do cutoff.
-        for cycle in sorted(eligible, key=lambda c: c.start_ts, reverse=True):
+        # Prioriza ciclos mais antigos para reduzir perda por cutoff.
+        for cycle in sorted(eligible, key=lambda c: c.start_ts):
+            if not self._can_open_more_positions():
+                break
+            side = self.paper_sequence[self.paper_sequence_idx]
             # Atualiza preco sempre para tentar com dado mais recente.
             self._refresh_cycle_side_prices(cycle)
             entry_price = cycle.up_price if side == "UP" else cycle.down_price
@@ -1014,6 +1021,8 @@ class FastResolver:
                 )
                 continue
 
+            sequence_index_before = self.paper_sequence_idx
+            sequence_index_after = (self.paper_sequence_idx + 1) % len(self.paper_sequence)
             position = PaperPosition(
                 slug=cycle.slug,
                 question=cycle.question,
@@ -1024,22 +1033,24 @@ class FastResolver:
                 entry_price=entry_price,
                 entry_ts=now_ts,
                 entry_cost=entry_cost,
-                sequence_index_before=self.paper_sequence_idx,
+                sequence_index_before=sequence_index_before,
                 gale_factor=current_gale_factor,
             )
-            self.paper_open_position = position
+            self.paper_open_positions[cycle.slug] = position
             self.paper_cash -= entry_cost
             self.paper_entered_slugs.add(cycle.slug)
             self.paper_range_warned_keys.discard(f"{cycle.slug}:{side}")
+            self.paper_sequence_idx = sequence_index_after
 
             print(
                 f"[PAPER ENTRY] {cycle.slug} | side={side} | shares={current_shares:.2f} | "
                 f"gale=x{current_gale_factor:.2f} | "
                 f"entry={entry_price:.4f} | cost={entry_cost:.4f} | "
                 f"mode={self.paper_sizing_mode} | cash_after_entry={self.paper_cash:.4f} | "
-                f"seq_step={self.paper_sequence_idx + 1}/{len(self.paper_sequence)}"
+                f"open_positions={len(self.paper_open_positions)} | "
+                f"seq_step={sequence_index_before + 1}/{len(self.paper_sequence)} | "
+                f"next_side={self.paper_sequence[self.paper_sequence_idx]}"
             )
-            return
 
     def _advance_sequence_for_missed_entries(self, now_ts: float) -> None:
         """
@@ -1053,7 +1064,7 @@ class FastResolver:
             if cycle.slug in self.paper_ignored_slugs:
                 continue
 
-            if self.paper_open_position is not None and self.paper_open_position.slug == cycle.slug:
+            if cycle.slug in self.paper_open_positions:
                 continue
 
             age = now_ts - cycle.start_ts
@@ -1104,10 +1115,8 @@ class FastResolver:
             )
 
     def _settle_paper_trade_if_needed(self, cycle: CycleState) -> None:
-        if self.paper_open_position is None:
-            return
-        position = self.paper_open_position
-        if position.slug != cycle.slug:
+        position = self.paper_open_positions.get(cycle.slug)
+        if position is None:
             return
         if cycle.inferred_result is None:
             return
@@ -1127,7 +1136,6 @@ class FastResolver:
             self.paper_losses += 1
             self.paper_loss_streak += 1
         sequence_index_after = (position.sequence_index_before + 1) % len(self.paper_sequence)
-        self.paper_sequence_idx = sequence_index_after
         next_gale_factor = self._current_gale_factor()
         if self.paper_sizing_mode == "USD":
             next_size_text = f"next_stake_usd={self._current_target_stake_usd():.4f}"
@@ -1140,12 +1148,13 @@ class FastResolver:
             f"won={'YES' if won else 'NO'} | trade_pnl={trade_pnl:+.4f} | "
             f"cash={self.paper_cash:.4f} | pnl={pnl_after:+.4f} | "
             f"record={self.paper_wins}W-{self.paper_losses}L | next_side={self.paper_sequence[self.paper_sequence_idx]} | "
-            f"next_gale=x{next_gale_factor:.2f} | {next_size_text}"
+            f"next_gale=x{next_gale_factor:.2f} | {next_size_text} | "
+            f"open_positions={max(0, len(self.paper_open_positions) - 1)}"
         )
 
         # Fecha posicao em memoria antes de persistir para evitar travar sequencia
         # caso a escrita em arquivo falhe temporariamente.
-        self.paper_open_position = None
+        self.paper_open_positions.pop(position.slug, None)
         try:
             self.paper_store.save_settlement(
                 position=position,
@@ -1451,9 +1460,15 @@ class FastResolver:
             f"base_shares={self.paper_shares:.2f} | base_stake_usd={self.paper_stake_usd:.4f} | "
             f"sequence={','.join(self.paper_sequence)} | entry_cutoff={self.paper_entry_cutoff_seconds:.1f}s | "
             f"entry_price_range={self.paper_entry_min_price:.2f}-{self.paper_entry_max_price:.2f} | "
+            f"max_open_positions={'ilimitado' if self.paper_max_open_positions <= 0 else self.paper_max_open_positions} | "
             f"gale_multiplier={self.paper_gale_multiplier:.2f} | "
             f"gale_max_steps={'ilimitado' if self.paper_gale_max_steps <= 0 else self.paper_gale_max_steps}"
         )
+        if self.paper_max_open_positions != 1 and self.paper_gale_multiplier > 1.0:
+            print(
+                "[AVISO] modo multi-posicao com gale ativo: entradas podem ser abertas antes de conhecer "
+                "resultado das anteriores; risco e variancia tendem a aumentar."
+            )
         print(f"[INIT] paper_csv_output={self.paper_store.csv_path}")
         if self.paper_store.enable_xlsx and self.paper_store.xlsx_path is not None:
             print(f"[INIT] paper_xlsx_output={self.paper_store.xlsx_path}")
@@ -1466,12 +1481,23 @@ class FastResolver:
 
                 # Monitoramos o ciclo atual e o imediatamente anterior.
                 for cycle_start in (bucket_start - 300, bucket_start):
-                    self.ensure_cycle(cycle_start)
+                    try:
+                        self.ensure_cycle(cycle_start)
+                    except Exception as e:
+                        print(f"[AVISO] Falha ao carregar ciclo {cycle_start}: {e}")
 
-                self.update_live_price_cache()
+                try:
+                    self.update_live_price_cache()
+                except Exception as e:
+                    # Nao interrompe paper-entry/fechamentos por falha transitoria da Chainlink.
+                    print(f"[AVISO] Falha ao atualizar live cache Chainlink: {e}")
 
                 for cycle in sorted(self.cycles.values(), key=lambda c: c.start_ts):
-                    self.process_cycle(cycle, now_ts)
+                    try:
+                        self.process_cycle(cycle, now_ts)
+                    except Exception as e:
+                        slug = str(getattr(cycle, "slug", "unknown"))
+                        print(f"[AVISO] Falha ao processar ciclo {slug}: {e}")
 
                 self._maybe_open_paper_trade(now_ts)
                 self._advance_sequence_for_missed_entries(now_ts)
@@ -1644,6 +1670,12 @@ def parse_args() -> argparse.Namespace:
         help="Numero maximo de passos de gale consecutivos (0 = sem limite).",
     )
     parser.add_argument(
+        "--paper-max-open-positions",
+        type=int,
+        default=1,
+        help="Numero maximo de posicoes simultaneas no paper trade (1 = modo sequencial atual, 0 = ilimitado).",
+    )
+    parser.add_argument(
         "--paper-output-csv",
         default=None,
         help="Arquivo CSV de saida do paper trade (default depende de --asset e --output-dir).",
@@ -1705,6 +1737,7 @@ def main() -> None:
         paper_entry_max_price=max(0.0, args.paper_entry_max_price),
         paper_gale_multiplier=max(1.0, args.paper_gale_multiplier),
         paper_gale_max_steps=max(0, args.paper_gale_max_steps),
+        paper_max_open_positions=max(0, args.paper_max_open_positions),
         paper_output_csv=paper_output_csv,
         paper_output_xlsx=paper_output_xlsx,
         enable_paper_xlsx=not args.paper_disable_xlsx,
